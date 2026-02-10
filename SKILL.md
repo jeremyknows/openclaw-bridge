@@ -13,6 +13,9 @@ compatibility: Requires Node.js >= 22 (native WebSocket) and network access to a
 metadata:
   author: openclaw
   version: "1.0.0"
+  openclaw:
+    requires:
+      bins: ["node"]
 ---
 
 ## Terminology
