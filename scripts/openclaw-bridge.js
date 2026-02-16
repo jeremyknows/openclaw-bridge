@@ -3,6 +3,7 @@
 
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 
 // --- Constants ---
 const CONNECTION_TIMEOUT = 5000;
@@ -73,20 +74,114 @@ if (command === "history" && cliArgs[2]) {
   }
 }
 
+// --- Device Identity (Ed25519) ---
+// OpenClaw 2026.2.15+ requires device identity for scoped access.
+// Without a device object, the gateway empties all scopes to [].
+const IDENTITY_DIR = path.join(process.env.HOME, ".openclaw", "bridge-identity");
+const IDENTITY_FILE = path.join(IDENTITY_DIR, "device-identity.json");
+const DEVICE_AUTH_FILE = path.join(IDENTITY_DIR, "device-auth.json");
+
+function base64UrlEncode(buf) {
+  return Buffer.from(buf).toString("base64url");
+}
+
+function derivePublicKeyRaw(publicKeyPem) {
+  const key = crypto.createPublicKey(publicKeyPem);
+  const spki = key.export({ type: "spki", format: "der" });
+  // Ed25519 SPKI is 44 bytes: 12-byte prefix + 32-byte raw key
+  return spki.subarray(12);
+}
+
+function loadOrCreateIdentity() {
+  try {
+    if (fs.existsSync(IDENTITY_FILE)) {
+      const data = JSON.parse(fs.readFileSync(IDENTITY_FILE, "utf-8"));
+      if (data?.version === 1 && data.deviceId && data.publicKeyPem && data.privateKeyPem) {
+        return data;
+      }
+    }
+  } catch { /* regenerate on error */ }
+
+  // Generate new Ed25519 key pair
+  const { publicKey, privateKey } = crypto.generateKeyPairSync("ed25519");
+  const publicKeyPem = publicKey.export({ type: "spki", format: "pem" }).toString();
+  const privateKeyPem = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+  const rawPub = derivePublicKeyRaw(publicKeyPem);
+  const deviceId = crypto.createHash("sha256").update(rawPub).digest("hex");
+
+  const identity = { version: 1, deviceId, publicKeyPem, privateKeyPem, createdAtMs: Date.now() };
+  fs.mkdirSync(IDENTITY_DIR, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(IDENTITY_FILE, JSON.stringify(identity, null, 2) + "\n", { mode: 0o600 });
+  return identity;
+}
+
+function signPayload(privateKeyPem, payload) {
+  const key = crypto.createPrivateKey(privateKeyPem);
+  return base64UrlEncode(crypto.sign(null, Buffer.from(payload, "utf8"), key));
+}
+
+function buildDeviceAuthPayload(params) {
+  const scopes = params.scopes.join(",");
+  const token = params.token ?? "";
+  return ["v1", params.deviceId, params.clientId, params.clientMode, params.role, scopes, String(params.signedAtMs), token].join("|");
+}
+
+function loadStoredDeviceToken(deviceId, role) {
+  try {
+    if (!fs.existsSync(DEVICE_AUTH_FILE)) return null;
+    const data = JSON.parse(fs.readFileSync(DEVICE_AUTH_FILE, "utf-8"));
+    if (data?.version !== 1 || data.deviceId !== deviceId) return null;
+    const entry = data.tokens?.[role];
+    return entry?.token ?? null;
+  } catch { return null; }
+}
+
+function storeDeviceToken(deviceId, role, token, scopes) {
+  const existing = (() => {
+    try {
+      if (fs.existsSync(DEVICE_AUTH_FILE)) {
+        const d = JSON.parse(fs.readFileSync(DEVICE_AUTH_FILE, "utf-8"));
+        if (d?.version === 1 && d.deviceId === deviceId) return d;
+      }
+    } catch {}
+    return null;
+  })();
+  const store = {
+    version: 1,
+    deviceId,
+    tokens: existing?.tokens ?? {}
+  };
+  store.tokens[role] = { token, role, scopes, updatedAtMs: Date.now() };
+  fs.mkdirSync(IDENTITY_DIR, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(DEVICE_AUTH_FILE, JSON.stringify(store, null, 2) + "\n", { mode: 0o600 });
+}
+
 // --- Config ---
 function readToken() {
+  // Check env var directly first (works when config uses ${} substitution)
+  if (process.env.OPENCLAW_GATEWAY_TOKEN) return process.env.OPENCLAW_GATEWAY_TOKEN;
   const configPath = path.join(process.env.HOME, ".openclaw", "openclaw.json");
   try {
     const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
-    const token = config?.gateway?.auth?.token;
+    let token = config?.gateway?.auth?.token;
     if (!token) die("Error: No gateway.auth.token found in " + configPath, EXIT.AUTH);
+    // Resolve ${VAR_NAME} env var substitution (matches OpenClaw config loader)
+    const envMatch = token.match(/^\$\{(.+)\}$/);
+    if (envMatch) {
+      token = process.env[envMatch[1]];
+      if (!token) die("Error: Env var " + envMatch[1] + " referenced in gateway.auth.token is not set", EXIT.AUTH);
+    }
     return token;
   } catch (e) {
     die("Error: Cannot read config at " + configPath + " — " + e.message, EXIT.AUTH);
   }
 }
 
+const IDENTITY = loadOrCreateIdentity();
 const TOKEN = readToken();
+const ROLE = "operator";
+const SCOPES = ["operator.read", "operator.write", "operator.admin", "operator.approvals", "operator.pairing"];
+const STORED_DEVICE_TOKEN = loadStoredDeviceToken(IDENTITY.deviceId, ROLE);
 const url = `${PROTOCOL}://${HOST}:${PORT}`;
 
 // --- WebSocket Request/Response Tracking ---
@@ -94,6 +189,7 @@ let msgId = 0;
 const pending = new Map();
 let authenticated = false;
 let sendRunId = null;
+let connectNonce = null;
 
 function sendReq(method, params) {
   const id = String(++msgId);
@@ -213,24 +309,83 @@ ws.onmessage = async (event) => {
     return;
   }
 
-  // Auth challenge
+  // Auth challenge — extract nonce for device signature
   if (msg.type === "event" && msg.event === "connect.challenge") {
     clearTimeout(connTimer);
+    connectNonce = msg.data?.nonce ?? null;
     try {
-      await sendReq("connect", {
+      // Build device signature for scoped access (required since OpenClaw 2026.2.15)
+      const signedAtMs = Date.now();
+      const authToken = STORED_DEVICE_TOKEN ?? TOKEN;
+      const payload = buildDeviceAuthPayload({
+        deviceId: IDENTITY.deviceId,
+        clientId: "gateway-client",
+        clientMode: "backend",
+        role: ROLE,
+        scopes: SCOPES,
+        signedAtMs,
+        token: authToken,
+      });
+      const signature = signPayload(IDENTITY.privateKeyPem, payload);
+      const publicKeyRaw = derivePublicKeyRaw(IDENTITY.publicKeyPem);
+
+      const connectParams = {
         minProtocol: 3,
         maxProtocol: 3,
         client: { id: "gateway-client", mode: "backend", version: "1.0.0", platform: process.platform },
         caps: [],
         commands: [],
-        role: "operator",
-        scopes: ["operator.admin"],
-        auth: { token: TOKEN },
-      });
+        role: ROLE,
+        scopes: SCOPES,
+        device: {
+          id: IDENTITY.deviceId,
+          publicKey: base64UrlEncode(publicKeyRaw),
+          signature,
+          signedAt: signedAtMs,
+        },
+        auth: { token: authToken },
+      };
+      const connectResult = await sendReq("connect", connectParams);
+
+      // Persist device token from hello-ok for future connections
+      if (connectResult?.auth?.deviceToken) {
+        storeDeviceToken(IDENTITY.deviceId, ROLE, connectResult.auth.deviceToken, connectResult.auth.scopes ?? SCOPES);
+      }
       authenticated = true;
       await runCommand();
       cleanup(0);
     } catch (e) {
+      // If stored device token is stale, clear it and retry with gateway token
+      if (STORED_DEVICE_TOKEN && (e.message?.includes("device_token_mismatch") || e.message?.includes("unauthorized"))) {
+        try { fs.unlinkSync(DEVICE_AUTH_FILE); } catch {}
+        console.error("Warning: Stored device token expired, retrying with gateway token...");
+        try {
+          const retrySignedAtMs = Date.now();
+          const retryPayload = buildDeviceAuthPayload({
+            deviceId: IDENTITY.deviceId, clientId: "gateway-client", clientMode: "backend",
+            role: ROLE, scopes: SCOPES, signedAtMs: retrySignedAtMs, token: TOKEN,
+          });
+          const retrySignature = signPayload(IDENTITY.privateKeyPem, retryPayload);
+          const retryPublicKeyRaw = derivePublicKeyRaw(IDENTITY.publicKeyPem);
+          const retryParams = {
+            minProtocol: 3, maxProtocol: 3,
+            client: { id: "gateway-client", mode: "backend", version: "1.0.0", platform: process.platform },
+            caps: [], commands: [], role: ROLE, scopes: SCOPES,
+            device: { id: IDENTITY.deviceId, publicKey: base64UrlEncode(retryPublicKeyRaw), signature: retrySignature, signedAt: retrySignedAtMs },
+            auth: { token: TOKEN },
+          };
+          const retryResult = await sendReq("connect", retryParams);
+          if (retryResult?.auth?.deviceToken) {
+            storeDeviceToken(IDENTITY.deviceId, ROLE, retryResult.auth.deviceToken, retryResult.auth.scopes ?? SCOPES);
+          }
+          authenticated = true;
+          await runCommand();
+          cleanup(0);
+          return;
+        } catch (retryErr) {
+          die("Error: Authentication failed after retry — " + retryErr.message, EXIT.AUTH);
+        }
+      }
       die("Error: Authentication failed — " + e.message, EXIT.AUTH);
     }
     return;

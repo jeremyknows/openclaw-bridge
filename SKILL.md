@@ -7,12 +7,12 @@ description: >
   session without triggering a run, (3) checking gateway status or listing
   sessions, (4) reading an agent's conversation history, (5) aborting a running
   agent, (6) managing cron jobs. Covers WebSocket authentication (protocol v3,
-  token auth), session key targeting, and a bundled Node.js bridge script.
+  Ed25519 device identity), session key targeting, and a bundled Node.js bridge script.
 license: MIT
 compatibility: Requires Node.js >= 22 (native WebSocket) and network access to an OpenClaw gateway
 metadata:
   author: openclaw
-  version: "1.0.0"
+  version: "1.1.0"
   openclaw:
     requires:
       bins: ["node"]
@@ -23,13 +23,14 @@ metadata:
 - **Bridge** — The `scripts/openclaw-bridge.js` script bundled with this skill. Zero dependencies (uses Node.js native WebSocket).
 - **Gateway** — The OpenClaw WebSocket server that accepts bridge connections and routes requests to agents.
 - **Session** — A named conversation context within an agent. Each session has its own message history and token budget.
+- **Device Identity** — Ed25519 keypair used to sign connection requests for scoped access (required since OpenClaw 2026.2.15).
 
 ## Prerequisites
 
 Before using the bridge, verify:
 
 1. **OpenClaw is running** — The gateway must be active. Test: `curl -s http://127.0.0.1:18789/status`
-2. **Gateway token exists** — Stored at `gateway.auth.token` in `~/.openclaw/openclaw.json`. The bridge reads it automatically. Never pass the token as a CLI argument or env var.
+2. **Gateway token exists** — Stored at `gateway.auth.token` in `~/.openclaw/openclaw.json`. The bridge reads it automatically. Can also be set via `OPENCLAW_GATEWAY_TOKEN` env var.
 3. **Node.js >= 22** — Required for native `WebSocket` support (no `npm install` needed).
 4. **Network access** — For remote gateways, set `OPENCLAW_HOST` and `OPENCLAW_PORT` env vars. The bridge uses `wss://` for non-localhost hosts automatically. For firewalled hosts, use an SSH tunnel: `ssh -L 18789:localhost:18789 user@remote`.
 
@@ -77,6 +78,7 @@ The bridge script is at `~/.claude/skills/openclaw-bridge/scripts/openclaw-bridg
 | `OPENCLAW_HOST` | `127.0.0.1` | Gateway host |
 | `OPENCLAW_PORT` | `18789` | Gateway port |
 | `OPENCLAW_SEND_TIMEOUT` | `120000` | Timeout in ms for `send` command (agent runs can take 2+ minutes) |
+| `OPENCLAW_GATEWAY_TOKEN` | (none) | Gateway token override (reads from config file if unset) |
 
 ### Exit Codes
 
@@ -91,18 +93,31 @@ The bridge script is at `~/.claude/skills/openclaw-bridge/scripts/openclaw-bridg
 
 ## Authentication Protocol
 
-The bridge handles authentication automatically. Here's what happens under the hood:
+The bridge handles authentication automatically using Ed25519 device identity. Here's what happens under the hood:
 
-1. Connect to `ws://{host}:{port}`
-2. Gateway sends a `connect.challenge` event
-3. Bridge responds with a `connect` request containing:
+1. Bridge loads or generates an Ed25519 keypair at `~/.openclaw/bridge-identity/device-identity.json`
+2. Connect to `ws://{host}:{port}`
+3. Gateway sends a `connect.challenge` event
+4. Bridge signs a payload (`v1|deviceId|clientId|clientMode|role|scopes|signedAtMs|token`) with its private key
+5. Bridge sends a `connect` request containing:
    - Protocol version 3 (required — older versions are rejected)
    - Client identity: `{ id: "gateway-client", mode: "backend", version: "1.0.0", platform }` — all fields required
-   - Auth: `{ token }` read from `~/.openclaw/openclaw.json` at `gateway.auth.token`
-   - Role: `operator` with `operator.admin` scope
-4. Gateway responds with `hello-ok` — authenticated
+   - Device identity: `{ id, publicKey, signature, signedAt }`
+   - Auth: `{ token }` read from `~/.openclaw/openclaw.json` at `gateway.auth.token` (or `OPENCLAW_GATEWAY_TOKEN` env var)
+   - Role: `operator` with scopes `["operator.read", "operator.write", "operator.admin", "operator.approvals", "operator.pairing"]`
+6. Gateway validates the signature, responds with `hello-ok` and a `deviceToken`
+7. Bridge caches the `deviceToken` at `~/.openclaw/bridge-identity/device-auth.json`
+8. Future connections use the cached `deviceToken` instead of the gateway token (faster auth)
+9. If the cached token is stale, the bridge automatically retries with the gateway token (no user intervention needed)
 
-The nonce in the challenge is only used for device-identity auth. Token auth ignores it.
+### Device Identity Files
+
+| File | Purpose | Permissions |
+|------|---------|-------------|
+| `~/.openclaw/bridge-identity/device-identity.json` | Ed25519 keypair (persists across connections) | `0600` |
+| `~/.openclaw/bridge-identity/device-auth.json` | Cached device token (auto-refreshes when stale) | `0600` |
+
+Both files are auto-generated on first run. The directory is mode `0700` (user-only access). The device ID is derived from a SHA-256 hash of the raw Ed25519 public key.
 
 ## Session Keys
 
@@ -185,10 +200,13 @@ This is the most common gotcha when setting up two-way communication. If a file 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
 | "Connection timed out" | Gateway not running | Start with `openclaw gateway start` or check `launchctl list \| grep openclaw` |
-| "Authentication failed" | Wrong token | Verify `gateway.auth.token` in `~/.openclaw/openclaw.json` matches the running gateway |
+| "Authentication failed" | Wrong token or stale device token | Verify `gateway.auth.token` in openclaw.json or `OPENCLAW_GATEWAY_TOKEN` env var. Delete `~/.openclaw/bridge-identity/device-auth.json` to force re-auth |
+| "device_token_mismatch" | Cached device token expired | Bridge auto-retries with gateway token — no action needed |
+| "Connection closed before auth" | Gateway rejected handshake | Ensure OpenClaw is 2026.2.15+ (protocol v3 required). All `client` fields required: `id`, `mode`, `version`, `platform` |
+| Device identity file corrupted | Malformed JSON or missing fields | Delete `~/.openclaw/bridge-identity/device-identity.json` — bridge regenerates on next run |
 | `PROTOCOL_VERSION` error | Protocol mismatch | Bridge uses v3. Ensure OpenClaw is up to date |
-| "Connection closed before auth" | Gateway rejected client fields | All `client` fields required: `id`, `mode`, `version`, `platform` |
 | Send times out at 120s | Agent run is slow or stuck | Increase `OPENCLAW_SEND_TIMEOUT` or use `abort` then retry |
 | "Operation failed" on send | Session doesn't exist or agent can't start | Run `sessions` to verify the session key exists and check token budget |
 | Concurrent run rejected | Hit concurrency limit | Default: 4 agent runs / 8 subagent runs. Wait or abort a running session |
 | History seems truncated | Session trimming | Sessions over 200 entries are trimmed to the last 100. This is normal |
+| File not where expected | Sandbox redirect | Check `~/.openclaw/workspace/` — agent's `write` tool is sandboxed there |
